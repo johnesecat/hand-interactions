@@ -1,475 +1,63 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
-  <meta name="apple-mobile-web-app-capable" content="yes"/>
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-fullscreen"/>
-  <title>Cloth Hand</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    html,body{width:100%;height:100%;background:#000;overflow:hidden;overscroll-behavior:none}
-    #video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
-    #c{position:fixed;top:0;left:0;width:100%;height:100%;will-change:transform}
-    #loading{
-      position:fixed;inset:0;background:#000;
-      display:flex;flex-direction:column;align-items:center;justify-content:center;
-      gap:16px;z-index:10;font-family:'Courier New',monospace;
-      color:#7fffd4;font-size:12px;letter-spacing:3px;text-transform:uppercase;
-    }
-    .ring{
-      width:52px;height:52px;border:1px solid #7fffd422;
-      border-top-color:#7fffd4;border-radius:50%;
-      animation:spin .9s linear infinite;
-    }
-    @keyframes spin{to{transform:rotate(360deg)}}
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Hand Mesh Generation and Cloth Simulation</title>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+    </style>
 </head>
 <body>
-  <div id="loading"><div class="ring"></div><span>Calibrating</span></div>
-  <video id="video" playsinline></video>
-  <canvas id="c"></canvas>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
 
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands_solution_simd_wasm_bin.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands_solution_packed_assets_loader.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+        // 3D Hand Mesh generation
+        const handGeometry = new THREE.BufferGeometry();
+        const handVertices = new Float32Array([]); // Add dynamic vertex generation logic here
+        handGeometry.setAttribute('position', new THREE.BufferAttribute(handVertices, 3));
+        const handMaterial = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+        const handMesh = new THREE.Mesh(handGeometry, handMaterial);
+        scene.add(handMesh);
 
-  <script>
-  'use strict';
-
-  /* ═══════════════════════════════════════════════
-     CONFIGURATION
-  ═══════════════════════════════════════════════ */
-  const CFG = {
-    CAM_W: 640, CAM_H: 480,
-    MIN_DET: 0.8, MIN_TRK: 0.8,
-    LM_ALPHA: 0.35,
-    CLOTH_COLS: 7,
-    CLOTH_ROWS: 6,
-    SUBSTEPS: 8,
-    GRAVITY: 0,
-    STIFFNESS: 0.9,
-    SHEAR_STIFFNESS: 0.55,
-    BEND_STIFFNESS: 0.35,
-    DAMPING: 0.982,
-    COLLISION_RADIUS: 16,
-    COLLISION_PUSH: 0.7,
-    SOFT_ATTRACT: 0.10,
-    MIRROR: true,
-  };
-
-  /* ═══════════════════════════════════════════════
-     CANVAS
-  ═══════════════════════════════════════════════ */
-  const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-  let W = 0, H = 0, DPR = 1;
-
-  function resizeCanvas() {
-    DPR = Math.min(window.devicePixelRatio || 1, 3);
-    W = window.innerWidth; H = window.innerHeight;
-    canvas.width  = Math.round(W * DPR);
-    canvas.height = Math.round(H * DPR);
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  }
-  window.addEventListener('resize', resizeCanvas, { passive: true });
-  resizeCanvas();
-
-  /* ═══════════════════════════════════════════════
-     LANDMARK SMOOTHING
-  ═══════════════════════════════════════════════ */
-  const smX = new Float32Array(21);
-  const smY = new Float32Array(21);
-  const smZ = new Float32Array(21);
-  let lmInit = false;
-
-  function smoothLandmarks(raw) {
-    const a = CFG.LM_ALPHA, b = 1 - a;
-    if (!lmInit) {
-      for (let i = 0; i < 21; i++) { smX[i]=raw[i].x; smY[i]=raw[i].y; smZ[i]=raw[i].z; }
-      lmInit = true;
-    } else {
-      for (let i = 0; i < 21; i++) {
-        smX[i] = a*raw[i].x + b*smX[i];
-        smY[i] = a*raw[i].y + b*smY[i];
-        smZ[i] = a*raw[i].z + b*smZ[i];
-      }
-    }
-  }
-
-  function lx(i) { return CFG.MIRROR ? (1 - smX[i]) * W : smX[i] * W; }
-  function ly(i) { return smY[i] * H; }
-  function lz(i) { return smZ[i]; }
-
-  /* ═══════════════════════════════════════════════
-     CLOTH PHYSICS
-     Verlet integration + constraint projection
-     "4D" axis: w4 — driven by collision events,
-     propagates as iridescent ripple through mesh,
-     visualized as hue + luminance displacement.
-  ═══════════════════════════════════════════════ */
-
-  const FINGER_CHAINS = [
-    [17,18,19,20],
-    [13,14,15,16],
-    [9,10,11,12],
-    [5,6,7,8],
-    [1,2,3,4],
-  ];
-
-  let clothPoints = [];
-  let constraints = [];
-  let fingerGrids = [];
-  let handPresent = false;
-
-  class CP {
-    constructor(x,y,z,pinned) {
-      this.x=x; this.y=y; this.z=z;
-      this.px=x; this.py=y; this.pz=z;
-      this.w=pinned?0:1;
-      this.w4=0; this.pw4=0;
-    }
-  }
-
-  function satisfyConstraint(a, b, rest, k) {
-    const dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
-    const d=Math.sqrt(dx*dx+dy*dy+dz*dz)||0.0001;
-    const diff=(d-rest)/d*k;
-    const wS=a.w+b.w; if(!wS) return;
-    const fx=dx*diff, fy=dy*diff, fz=dz*diff;
-    if(a.w){a.x+=fx*(a.w/wS);a.y+=fy*(a.w/wS);a.z+=fz*(a.w/wS);}
-    if(b.w){b.x-=fx*(b.w/wS);b.y-=fy*(b.w/wS);b.z-=fz*(b.w/wS);}
-  }
-
-  // Constraint buffer — flat arrays for cache efficiency
-  let cA=[], cB=[], cRest=[], cK=[];
-
-  function addConstraint(a, b, k) {
-    const rest = Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2);
-    cA.push(a); cB.push(b); cRest.push(rest); cK.push(k);
-  }
-
-  function getFingerPerp(chain, t, W, H) {
-    const chainIdx = Math.min(Math.floor(t*(chain.length-1)), chain.length-2);
-    const localT = t*(chain.length-1) - chainIdx;
-    const lmA=chain[chainIdx], lmB=chain[Math.min(chainIdx+1,chain.length-1)];
-    const cx = lx(lmA)+(lx(lmB)-lx(lmA))*localT;
-    const cy = ly(lmA)+(ly(lmB)-ly(lmA))*localT;
-    const cz = lz(lmA)+(lz(lmB)-lz(lmA))*localT;
-    // Forward direction
-    const t2=Math.min(t+0.01,1);
-    const ci2=Math.min(Math.floor(t2*(chain.length-1)),chain.length-2);
-    const lt2=t2*(chain.length-1)-ci2;
-    const nx=lx(chain[ci2])+(lx(chain[Math.min(ci2+1,chain.length-1)])-lx(chain[ci2]))*lt2;
-    const ny=ly(chain[ci2])+(ly(chain[Math.min(ci2+1,chain.length-1)])-ly(chain[ci2]))*lt2;
-    const flen=Math.sqrt((nx-cx)**2+(ny-cy)**2)||1;
-    return { cx, cy, cz, pdx:-(ny-cy)/flen, pdy:(nx-cx)/flen };
-  }
-
-  function buildCloth() {
-    clothPoints=[]; cA=[]; cB=[]; cRest=[]; cK=[]; fingerGrids=[];
-    const cols=CFG.CLOTH_COLS, rows=CFG.CLOTH_ROWS;
-    const handScale=Math.hypot(lx(0)-lx(9),ly(0)-ly(9));
-    const halfW=Math.max(10, handScale*0.13);
-
-    for(let f=0;f<FINGER_CHAINS.length;f++){
-      const chain=FINGER_CHAINS[f];
-      const grid=[];
-      for(let row=0;row<rows;row++){
-        const t=row/(rows-1);
-        const {cx,cy,cz,pdx,pdy}=getFingerPerp(chain,t);
-        const rowPts=[];
-        for(let col=0;col<cols;col++){
-          const u=(col/(cols-1)-0.5)*2;
-          const fw=halfW*(f===4?0.7:1)*(1-t*0.35); // taper toward tip
-          const pt=new CP(cx+pdx*u*fw, cy+pdy*u*fw, cz, row===0);
-          clothPoints.push(pt);
-          rowPts.push(pt);
+        // Verlet integration for cloth simulation
+        class Cloth {
+            constructor(vertices, indices) {
+                this.vertices = vertices;
+                this.indices = indices;
+            }
+            simulate() {
+                // Implement Verlet integration logic here
+            }
         }
-        grid.push(rowPts);
-      }
-      fingerGrids.push({grid,chain});
 
-      for(let row=0;row<rows;row++){
-        for(let col=0;col<cols;col++){
-          const pt=grid[row][col];
-          if(col<cols-1) addConstraint(pt,grid[row][col+1],CFG.STIFFNESS);
-          if(row<rows-1) addConstraint(pt,grid[row+1][col],CFG.STIFFNESS);
-          if(col<cols-1&&row<rows-1){
-            addConstraint(pt,grid[row+1][col+1],CFG.SHEAR_STIFFNESS);
-            addConstraint(grid[row][col+1],grid[row+1][col],CFG.SHEAR_STIFFNESS);
-          }
-          if(col<cols-2) addConstraint(pt,grid[row][col+2],CFG.BEND_STIFFNESS);
-          if(row<rows-2) addConstraint(pt,grid[row+2][col],CFG.BEND_STIFFNESS);
+        // Collision detection
+        function checkCollisions() {
+            // Implement collision detection logic here
         }
-      }
-    }
-  }
 
-  function pinToHand() {
-    const cols=CFG.CLOTH_COLS, rows=CFG.CLOTH_ROWS;
-    const handScale=Math.hypot(lx(0)-lx(9),ly(0)-ly(9));
-    const halfW=Math.max(10,handScale*0.13);
-
-    for(let f=0;f<fingerGrids.length;f++){
-      const {grid,chain}=fingerGrids[f];
-      for(let row=0;row<rows;row++){
-        const t=row/(rows-1);
-        const {cx,cy,cz,pdx,pdy}=getFingerPerp(chain,t);
-        for(let col=0;col<cols;col++){
-          const pt=grid[row][col];
-          const u=(col/(cols-1)-0.5)*2;
-          const fw=halfW*(f===4?0.7:1)*(1-t*0.35);
-          const tx=cx+pdx*u*fw, ty=cy+pdy*u*fw;
-          if(row===0){
-            pt.px=pt.x; pt.py=pt.y; pt.pz=pt.z;
-            pt.x=tx; pt.y=ty; pt.z=cz;
-          } else {
-            const at=CFG.SOFT_ATTRACT*(1-t*0.5);
-            pt.x+=(tx-pt.x)*at;
-            pt.y+=(ty-pt.y)*at;
-            pt.z+=(cz-pt.z)*at;
-          }
+        // Main loop
+        function animate() {
+            requestAnimationFrame(animate);
+            // Update mesh and cloth conditions
+            checkCollisions();
+            renderer.render(scene, camera);
         }
-      }
-    }
-  }
+        animate();
 
-  function stepCloth(dt) {
-    if(!handPresent||clothPoints.length===0) return;
-    pinToHand();
-
-    // Verlet
-    for(let i=0;i<clothPoints.length;i++){
-      const p=clothPoints[i];
-      if(!p.w) continue;
-      const vx=(p.x-p.px)*CFG.DAMPING;
-      const vy=(p.y-p.py)*CFG.DAMPING+CFG.GRAVITY*dt*dt;
-      const vz=(p.z-p.pz)*CFG.DAMPING;
-      const vw=(p.w4-p.pw4)*CFG.DAMPING;
-      p.pw4=p.w4; p.w4+=vw;
-      p.px=p.x; p.py=p.y; p.pz=p.z;
-      p.x+=vx; p.y+=vy; p.z+=vz;
-    }
-
-    // Constraints + collision
-    for(let sub=0;sub<CFG.SUBSTEPS;sub++){
-      // Constraint satisfaction
-      for(let c=0;c<cA.length;c++){
-        const a=cA[c],b=cB[c];
-        const dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z;
-        const d=Math.sqrt(dx*dx+dy*dy+dz*dz)||0.0001;
-        const diff=(d-cRest[c])/d*cK[c];
-        const wS=a.w+b.w; if(!wS) continue;
-        const fx=dx*diff,fy=dy*diff,fz=dz*diff;
-        if(a.w){a.x+=fx*(a.w/wS);a.y+=fy*(a.w/wS);}
-        if(b.w){b.x-=fx*(b.w/wS);b.y-=fy*(b.w/wS);}
-      }
-
-      // Hand collision
-      const r=CFG.COLLISION_RADIUS, r2=r*r;
-      for(let lm=0;lm<21;lm++){
-        const hx=lx(lm),hy=ly(lm);
-        for(let i=0;i<clothPoints.length;i++){
-          const p=clothPoints[i];
-          if(!p.w) continue;
-          const dx=p.x-hx,dy=p.y-hy;
-          const d2=dx*dx+dy*dy;
-          if(d2<r2&&d2>0.001){
-            const d=Math.sqrt(d2);
-            const pen=(r-d)/d*CFG.COLLISION_PUSH;
-            p.x+=dx*pen; p.y+=dy*pen;
-            // 4D ripple on collision
-            p.w4+=pen*0.8;
-          }
-        }
-      }
-    }
-
-    // Propagate + dampen w4
-    for(let i=0;i<clothPoints.length;i++){
-      clothPoints[i].w4*=0.86;
-    }
-  }
-
-  /* ═══════════════════════════════════════════════
-     RENDERER
-  ═══════════════════════════════════════════════ */
-  let bgTime=0;
-
-  function drawBackground() {
-    bgTime+=0.006;
-    ctx.fillStyle='#05050f';
-    ctx.fillRect(0,0,W,H);
-    if(handPresent){
-      const hcx=lx(9),hcy=ly(9);
-      const pulse=Math.sin(bgTime*1.8)*0.03+0.05;
-      const g=ctx.createRadialGradient(hcx,hcy,0,hcx,hcy,H*0.6);
-      g.addColorStop(0,`rgba(15,5,40,${pulse.toFixed(3)})`);
-      g.addColorStop(1,'rgba(5,5,15,0)');
-      ctx.fillStyle=g;
-      ctx.fillRect(0,0,W,H);
-    }
-  }
-
-  function drawCloth() {
-    if(!handPresent||fingerGrids.length===0) return;
-    const cols=CFG.CLOTH_COLS, rows=CFG.CLOTH_ROWS;
-
-    for(let f=0;f<fingerGrids.length;f++){
-      const {grid}=fingerGrids[f];
-      for(let row=0;row<rows-1;row++){
-        for(let col=0;col<cols-1;col++){
-          const p00=grid[row][col],p10=grid[row+1][col];
-          const p01=grid[row][col+1],p11=grid[row+1][col+1];
-
-          // Surface normal for lighting
-          const ax=p01.x-p00.x,ay=p01.y-p00.y,az=(p01.z-p00.z)*300;
-          const bx=p10.x-p00.x,by=p10.y-p00.y,bz=(p10.z-p00.z)*300;
-          const nz=ax*by-ay*bx;
-          const nlen=Math.sqrt(ax*ax+ay*ay+bx*bx+by*by)||1;
-          const light=Math.max(0,Math.min(1,(nz/nlen)*0.5+0.6));
-
-          const w4=(p00.w4+p10.w4+p01.w4+p11.w4)*0.25;
-          const depth=(p00.z+p10.z+p01.z+p11.z)*0.25;
-
-          // Skin-like iridescent palette
-          const baseHue=20+f*15;
-          const hue=(baseHue+w4*200+depth*80+light*30)%360;
-          const sat=50+light*35+Math.abs(w4)*50;
-          const lum=30+light*50+Math.abs(w4)*25;
-          const al=Math.min(0.92, 0.68+Math.abs(w4)*0.3+light*0.1);
-
-          // Triangle 1
-          ctx.globalAlpha=al;
-          ctx.fillStyle=`hsl(${hue|0},${sat|0}%,${lum|0}%)`;
-          ctx.beginPath();
-          ctx.moveTo(p00.x,p00.y);
-          ctx.lineTo(p10.x,p10.y);
-          ctx.lineTo(p01.x,p01.y);
-          ctx.closePath();
-          ctx.fill();
-
-          // Triangle 2
-          ctx.beginPath();
-          ctx.moveTo(p10.x,p10.y);
-          ctx.lineTo(p11.x,p11.y);
-          ctx.lineTo(p01.x,p01.y);
-          ctx.closePath();
-          ctx.fill();
-
-          // 4D ripple glint
-          if(Math.abs(w4)>0.06){
-            const glint=Math.min(0.7,Math.abs(w4)*2.5);
-            ctx.globalAlpha=glint;
-            ctx.fillStyle=`hsl(${(hue+140)|0},100%,92%)`;
-            ctx.beginPath();
-            ctx.moveTo(p00.x,p00.y);
-            ctx.lineTo(p10.x,p10.y);
-            ctx.lineTo(p11.x,p11.y);
-            ctx.lineTo(p01.x,p01.y);
-            ctx.closePath();
-            ctx.fill();
-          }
-        }
-      }
-
-      // Rim edge
-      ctx.globalAlpha=0.55;
-      ctx.strokeStyle='rgba(255,255,255,0.6)';
-      ctx.lineWidth=0.7;
-      ctx.beginPath();
-      for(let row=0;row<rows;row++){
-        const p=grid[row][0];
-        row===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y);
-      }
-      for(let row=rows-1;row>=0;row--){
-        ctx.lineTo(grid[row][cols-1].x,grid[row][cols-1].y);
-      }
-      ctx.closePath();
-      ctx.stroke();
-    }
-    ctx.globalAlpha=1;
-
-    // Subtle landmark glow through cloth
-    ctx.globalAlpha=0.15;
-    ctx.fillStyle='#fff';
-    for(let i=0;i<21;i++){
-      ctx.beginPath();
-      ctx.arc(lx(i),ly(i),5,0,6.2832);
-      ctx.fill();
-    }
-    ctx.globalAlpha=1;
-  }
-
-  const SKEL=[0,1,1,2,2,3,3,4,0,5,5,6,6,7,7,8,5,9,9,10,10,11,11,12,9,13,13,14,14,15,15,16,13,17,17,18,18,19,19,20,0,17];
-  function drawSkeleton(){
-    ctx.globalAlpha=0.1;ctx.strokeStyle='#fff';ctx.lineWidth=2;
-    ctx.beginPath();
-    for(let i=0;i<SKEL.length;i+=2){
-      ctx.moveTo(lx(SKEL[i]),ly(SKEL[i]));
-      ctx.lineTo(lx(SKEL[i+1]),ly(SKEL[i+1]));
-    }
-    ctx.stroke();ctx.globalAlpha=1;
-  }
-
-  /* ═══════════════════════════════════════════════
-     INFERENCE (decoupled)
-  ═══════════════════════════════════════════════ */
-  let latestLM=null, newResult=false, inFlight=false;
-  const video=document.getElementById('video');
-  const loading=document.getElementById('loading');
-
-  const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
-  hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:CFG.MIN_DET,minTrackingConfidence:CFG.MIN_TRK});
-  hands.onResults(r=>{
-    inFlight=false;
-    if(loading.style.display!=='none') loading.style.display='none';
-    latestLM=(r.multiHandLandmarks&&r.multiHandLandmarks.length>0)?r.multiHandLandmarks[0]:null;
-    newResult=true;
-  });
-
-  const cam=new Camera(video,{
-    onFrame:async()=>{ if(inFlight)return; inFlight=true; await hands.send({image:video}); },
-    width:CFG.CAM_W,height:CFG.CAM_H,
-  });
-  cam.start();
-
-  /* ═══════════════════════════════════════════════
-     MAIN LOOP
-  ═══════════════════════════════════════════════ */
-  let lastT=performance.now(), needBuild=false;
-
-  function frame(now){
-    requestAnimationFrame(frame);
-    const dt=Math.min((now-lastT)/1000,0.033);
-    lastT=now;
-
-    if(newResult){
-      newResult=false;
-      if(latestLM){
-        smoothLandmarks(latestLM);
-        if(!handPresent){handPresent=true;needBuild=true;}
-      } else {
-        if(handPresent){handPresent=false;lmInit=false;}
-      }
-    }
-    if(needBuild&&handPresent){buildCloth();needBuild=false;}
-
-    if(handPresent) stepCloth(dt);
-
-    drawBackground();
-    if(handPresent){drawSkeleton();drawCloth();}
-    else{
-      ctx.globalAlpha=0.2;ctx.fillStyle='#7fffd4';
-      ctx.font='13px Courier New';ctx.textAlign='center';
-      ctx.fillText('SHOW HAND',W/2,H/2);ctx.globalAlpha=1;
-    }
-  }
-  requestAnimationFrame(frame);
-  </script>
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
 </body>
 </html>
